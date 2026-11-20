@@ -3,23 +3,27 @@
 """
 iamhc(api.hcnsec.cn)每日自动签到。
 
-为什么原版会失败
-----------------
-站点已在登录接口上开启 Cloudflare Turnstile 校验:
-    POST /api/user/login?turnstile=<token>
-原版 checkin.py 里 `TURNSTILE_TOKEN = ""` 是写死的空字符串,
-所以服务端返回 "登录失败: Turnstile token is empty",脚本随即 exit 1。
+两个坑,本脚本都已处理
+--------------------
+1) 登录接口开启了 Cloudflare Turnstile 校验:POST /api/user/login?turnstile=<token>
+   原版把 TURNSTILE_TOKEN 写死为空串,所以报 "登录失败: Turnstile token is empty"。
+2) 登录成功的返回结构变了(新版 new-api):
+      data.access_token / data.token_type / data.session / data.user
+   用户 id 在 data.user.id,不再是 data.id;
+   老结构会报 "登录成功但未获取到用户 ID"。
+   若账号开了登录二次验证,data 会变成
+      {"require_verification": true, "flow_token": ..., "methods": {...}}
+   脚本检测到会明确提示,不会静默失败。
 
-本脚本先取到一个真实可用的 Turnstile token,再登录签到。取值顺序:
+Turnstile token 获取顺序:
   1) 配了 CAPTCHA_API_KEY → 调用打码平台(YesCaptcha / CapSolver / 2Captcha);
-  2) 没配 → 用浏览器自动化(patchright 优先,回退 playwright)打开登录页,
-     读取站点自身 widget 写回的真实 token。
+  2) 没配 → 浏览器自动化(patchright 优先,回退 playwright)打开登录页取真实 token。
 
 用法
 ----
     python checkin.py                # 正常签到
     python checkin.py --token-only   # 只取 token 并打印(自检,不需要账号密码)
-    python checkin.py --headed       # 有头浏览器(本地调试;CI 里请配合 xvfb)
+    python checkin.py --headed       # 有头浏览器(本地调试;CI 里配合 xvfb)
 
 常用环境变量
 ------------
@@ -257,8 +261,42 @@ def get_turnstile_token():
 # 二、登录 / 签到
 # ---------------------------------------------------------------------------
 
+def _extract_user(payload):
+    """兼容多种返回结构,把用户信息 dict 抠出来。
+
+    新结构:data.user.{id,username,quota,...}
+    自省接口:data.{id,username,quota,...}
+    旧结构:data.{id,username,...}
+    """
+    if not isinstance(payload, dict):
+        return None
+    for key in ("user", "data"):
+        sub = payload.get(key)
+        if isinstance(sub, dict) and sub.get("id"):
+            return sub
+    if payload.get("id"):
+        return payload
+    return None
+
+
+def _api_headers(user_id, access_token, json_body=False):
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": UA,
+        "Origin": BASE_URL,
+        "Referer": f"{BASE_URL}/",
+    }
+    if json_body:
+        headers["Content-Type"] = "application/json"
+    if user_id:
+        headers["New-Api-User"] = str(user_id)
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    return headers
+
+
 def login(session, turnstile_token):
-    """登录。返回 (用户信息 或 None, 服务端消息)。"""
+    """登录。返回 (用户信息 或 None, 服务端消息, access_token)。"""
     login_url = f"{BASE_URL}/api/user/login?turnstile={quote(turnstile_token)}"
     headers = {
         "Accept": "application/json, text/plain, */*",
@@ -274,53 +312,62 @@ def login(session, turnstile_token):
         timeout=20,
     )
     if resp.status_code != 200:
-        return None, f"HTTP {resp.status_code}: {resp.text[:200]}"
+        return None, f"HTTP {resp.status_code}: {resp.text[:200]}", ""
 
     try:
         data = resp.json()
     except Exception:
-        return None, f"返回内容不是 JSON: {resp.text[:200]}"
+        return None, f"返回内容不是 JSON: {resp.text[:200]}", ""
 
     if not data.get("success"):
-        return None, str(data.get("message", ""))
+        return None, str(data.get("message", "")), ""
 
-    user_data = data.get("data") or {}
-    user_id = user_data.get("id")
-    username = user_data.get("username", "")
-    if not user_id:
-        return None, "登录成功但未获取到用户 ID"
+    payload = data.get("data")
+    access_token = ""
+    if isinstance(payload, dict):
+        access_token = payload.get("access_token") or ""
+        if payload.get("require_verification"):
+            methods = payload.get("methods")
+            return (None,
+                    f"该账号开启了登录二次验证(require_verification),需人工完成,"
+                    f"脚本无法自动通过。methods={json.dumps(methods, ensure_ascii=False)[:200]}",
+                    access_token)
+
+    user = _extract_user(payload) or _extract_user(data)
+    if not user:
+        print("登录响应结构未识别,原始内容:",
+              json.dumps(data, ensure_ascii=False)[:500])
+        return None, "登录成功但没有解析出用户 ID(原始响应已打印在上方)", access_token
+
+    user_id = user.get("id")
+    username = user.get("username", str(user_id))
     print(f"✅ 登录成功 | 账户: {username} | ID: {user_id}")
-    return {"id": user_id, "username": username}, ""
+    return {"id": user_id, "username": username}, "", access_token
 
 
-def get_user_info(session, user_id):
+def get_user_info(session, user_id, access_token):
     url = f"{BASE_URL}/api/user/self"
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "User-Agent": UA,
-        "Referer": BASE_URL,
-        "New-Api-User": str(user_id),
-    }
     try:
-        data = session.get(url, headers=headers, timeout=20).json()
+        data = session.get(url,
+                           headers=_api_headers(user_id, access_token),
+                           timeout=20).json()
     except Exception as exc:
         print("获取用户信息异常:", type(exc).__name__, exc)
         return None
-    return data.get("data") if data.get("success") else None
+    if not data.get("success"):
+        print("获取用户信息失败:", json.dumps(data, ensure_ascii=False)[:300])
+        return None
+    return _extract_user(data.get("data")) or _extract_user(data)
 
 
-def checkin(session, user_id):
+def checkin(session, user_id, access_token):
     url = f"{BASE_URL}/api/user/checkin"
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Content-Type": "application/json",
-        "User-Agent": UA,
-        "Origin": BASE_URL,
-        "Referer": BASE_URL,
-        "New-Api-User": str(user_id),
-    }
     try:
-        return session.post(url, headers=headers, json={}, timeout=20).json()
+        resp = session.post(url,
+                            headers=_api_headers(user_id, access_token, json_body=True),
+                            json={},
+                            timeout=20)
+        return resp.json()
     except Exception as exc:
         return {"success": False, "message": f"签到请求异常: {type(exc).__name__} {exc}"}
 
@@ -377,19 +424,21 @@ def main():
     session = requests.Session()
 
     # 登录(最多两次:token 过期或服务端判空时,重新取一个 token 再试)
-    user, message = None, ""
+    user, message, access_token = None, "", ""
     for attempt in (1, 2):
         token = get_turnstile_token()
         if not token:
             message = "无法获取 Turnstile token(打码平台失败且浏览器方式也没拿到)"
             print(message)
             break
-        user, message = login(session, token)
+        user, message, access_token = login(session, token)
         if user:
             break
         low = (message or "").lower()
         need_retry = ("turnstile" in low or "token" in low
                       or "人机" in (message or "") or "验证" in (message or ""))
+        if "二次验证" in (message or "") or "require_verification" in low:
+            need_retry = False
         print(f"第 {attempt} 次登录失败: {message}")
         if attempt == 2 or not need_retry:
             break
@@ -400,25 +449,24 @@ def main():
         print("\n登录失败,无法继续签到")
         send_notification(
             "🎁 iamhc 签到通知\n\n"
-            f"❌ 登录失败,无法签到\n"
-            f"原因: {message or '未知'}\n"
-            f"提示: 站点登录接口已开启 Turnstile 校验,"
-            f"请确认补丁脚本已生效(见 README)"
+            "❌ 登录失败,无法签到\n"
+            f"原因: {message or '未知'}"
         )
         return 1
 
     user_id = user["id"]
     username = user.get("username", str(user_id))
 
-    info_before = get_user_info(session, user_id)
+    info_before = get_user_info(session, user_id, access_token)
     if not info_before:
         print("获取用户信息失败")
         return 1
     balance_before = quota_to_dollar(info_before.get("quota", 0))
 
-    checkin_data = checkin(session, user_id)
+    checkin_data = checkin(session, user_id, access_token)
+    print("签到接口返回:", json.dumps(checkin_data, ensure_ascii=False)[:300])
 
-    info_after = get_user_info(session, user_id)
+    info_after = get_user_info(session, user_id, access_token)
     if not info_after:
         print("获取签到后用户信息失败")
         return 1

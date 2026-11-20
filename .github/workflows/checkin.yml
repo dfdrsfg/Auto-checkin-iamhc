@@ -2,13 +2,14 @@ name: iamhc Daily Checkin
 
 on:
   schedule:
-    # 每天 UTC 23:00 运行（即北京时间次日 07:00）
+    # 每天 UTC 23:00 运行(即北京时间次日 07:00)
     - cron: '0 23 * * *'
   workflow_dispatch: # 支持手动触发
 
 jobs:
   checkin:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       actions: write
       contents: read
@@ -23,7 +24,14 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install requests
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests "patchright==1.64.3"
+          # 下载 chromium 及系统依赖(Turnstile 需要一个真浏览器)
+          python -m patchright install --with-deps chromium
+
+      - name: Install xvfb
+        run: sudo apt-get update && sudo apt-get install -y xvfb
 
       - name: Run checkin
         env:
@@ -31,7 +39,12 @@ jobs:
           PASSWORD: ${{ secrets.PASSWORD }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
-        run: python checkin.py
+          # 可选:配置了打码平台 key 就优先走打码平台,不需要浏览器
+          CAPTCHA_API_KEY: ${{ secrets.CAPTCHA_API_KEY }}
+          CAPTCHA_PROVIDER: ${{ vars.CAPTCHA_PROVIDER }}
+          # xvfb 提供虚拟显示,因此让浏览器以"有头"方式运行才能通过 Turnstile
+          HEADLESS: '0'
+        run: xvfb-run -a --server-args="-screen 0 1920x1080x24" python checkin.py
 
       - name: clear old run jobs
         if: always()
